@@ -1,4 +1,4 @@
-import pandas as pd
+import tempfile
 import streamlit as st
 import plotly.graph_objects as go
 from fpdf import FPDF
