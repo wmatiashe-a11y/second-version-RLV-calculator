@@ -1,3 +1,36 @@
+import io
+
+def build_pdf_bytes(summary_lines: list[str]) -> bytes:
+    """
+    Returns a simple PDF as raw bytes.
+    Requires: reportlab
+    """
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.pagesizes import A4
+
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    width, height = A4
+
+    y = height - 50
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(50, y, "Feasibility Report (RLV)")
+    y -= 25
+
+    c.setFont("Helvetica", 10)
+    for line in summary_lines:
+        if y < 60:
+            c.showPage()
+            y = height - 50
+            c.setFont("Helvetica", 10)
+        c.drawString(50, y, str(line))
+        y -= 14
+
+    c.save()
+    pdf_bytes = buf.getvalue()
+    buf.close()
+    return pdf_bytes
+
 import streamlit as st
 import pandas as pd
 from fpdf import FPDF
