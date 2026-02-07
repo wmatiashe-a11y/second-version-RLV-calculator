@@ -146,7 +146,7 @@ def create_pdf_bytes() -> bytes:
     scenario_block("IH + Bonus", ihb_rlv, ihb_gdv, ihb_bulk, ihb_dcs, ihb_ih_bulk)
 
     # Return bytes that Streamlit download_button accepts
-    pdf_bytes = pdf.output(dest="S").encode("latin-1")
+    raw = pdf.output(dest="S") pdf_bytes = raw if isinstance(raw, (bytes, bytearray)) else raw.encode("latin-1")
     return pdf_bytes
 
 
