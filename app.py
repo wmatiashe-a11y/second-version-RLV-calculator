@@ -1,6 +1,6 @@
 import pandas as pd
 import streamlit as st
-import plotly.express as px
+import plotly.graph_objects as go
 from fpdf import FPDF
 
 
@@ -49,11 +49,6 @@ density_bonus = st.sidebar.slider("Density Bonus (%)", 0, 100, 20, step=5)
 # Calculation Engine
 # -----------------------
 def calculate_metrics(land, ff, bonus, ih, m_price, c_cost):
-    """
-    NOTE:
-    - bonus and ih are in percent (0-100) in this version
-    - total_bulk is treated as "bulk m²"
-    """
     total_bulk = (land * ff) * (1 + (bonus / 100.0))
     ih_bulk = total_bulk * (ih / 100.0)
     market_bulk = total_bulk - ih_bulk
@@ -83,14 +78,14 @@ ff_val = ZONING[zone_choice]["ff"]
 base_rlv, base_bulk, base_dcs, base_gdv, base_ih_bulk = calculate_metrics(
     land_size, ff_val, bonus=0, ih=0, m_price=market_price, c_cost=const_cost
 )
-ih_rlv, ih_bulk, ih_dcs, ih_gdv, ih_ih_bulk = calculate_metrics(
+ih_rlv, ih_bulk0, ih_dcs, ih_gdv, ih_ih_bulk = calculate_metrics(
     land_size, ff_val, bonus=0, ih=ih_req, m_price=market_price, c_cost=const_cost
 )
 ihb_rlv, ihb_bulk, ihb_dcs, ihb_gdv, ihb_ih_bulk = calculate_metrics(
     land_size, ff_val, bonus=density_bonus, ih=ih_req, m_price=market_price, c_cost=const_cost
 )
 
-# Use IH+Bonus as headline outputs (your current behavior)
+# Headline outputs
 rlv, bulk, dcs, gdv, ih_bulk = ihb_rlv, ihb_bulk, ihb_dcs, ihb_gdv, ihb_ih_bulk
 
 
@@ -102,17 +97,40 @@ def create_pdf_bytes() -> bytes:
     pdf.add_page()
 
     pdf.set_font("Arial", "B", 14)
-    pdf.cell(190, 10, "Site Feasibility Report", ln=True)
+    pdf.cell(190, 10, "Site Feasibility Report: Cape Town Redevelopment", ln=True, align="C")
+    pdf.ln(6)
 
-    # --- example content ---
+    pdf.set_font("Arial", "B", 12)
+    pdf.cell(190, 8, "Inputs", ln=True)
     pdf.set_font("Arial", "", 10)
-    pdf.cell(190, 8, f"RLV: {money(rlv)}", ln=True)
+    pdf.cell(190, 7, f"Land area: {land_size} m²", ln=True)
+    pdf.cell(190, 7, f"Zoning: {zone_choice} (FAR={ff_val})", ln=True)
+    pdf.cell(190, 7, f"Parking zone: {parking_zone}", ln=True)
+    pdf.cell(190, 7, f"Market price: {money(market_price)}/m²", ln=True)
+    pdf.cell(190, 7, f"Construction cost used: {money(const_cost)}/m²", ln=True)
+    pdf.cell(190, 7, f"IH requirement: {ih_req}%", ln=True)
+    pdf.cell(190, 7, f"Density bonus: +{density_bonus}%", ln=True)
 
-    # ✅ Correct indentation here
+    pdf.ln(6)
+    pdf.set_font("Arial", "B", 12)
+    pdf.cell(190, 8, "Scenario Summary", ln=True)
+    pdf.set_font("Arial", "", 10)
+
+    def line(title, rlv_v, gdv_v, bulk_v, dcs_v):
+        pdf.set_font("Arial", "B", 10)
+        pdf.cell(190, 7, title, ln=True)
+        pdf.set_font("Arial", "", 10)
+        pdf.cell(190, 6, f"RLV: {money(rlv_v)} | GDV: {money(gdv_v)} | Bulk: {bulk_v:,.0f} m² | Dev Charges: {money(dcs_v)}", ln=True)
+        pdf.ln(2)
+
+    line("Base (No IH, No Bonus)", base_rlv, base_gdv, base_bulk, base_dcs)
+    line("IH Only", ih_rlv, ih_gdv, ih_bulk0, ih_dcs)
+    line("IH + Bonus", ihb_rlv, ihb_gdv, ihb_bulk, ihb_dcs)
+
     raw = pdf.output(dest="S")
     pdf_bytes = raw if isinstance(raw, (bytes, bytearray)) else raw.encode("latin-1")
-
     return pdf_bytes
+
 
 st.sidebar.download_button(
     label="📥 Download Feasibility Report (PDF)",
@@ -138,26 +156,25 @@ st.subheader("Scenario Comparison")
 sc_df = pd.DataFrame(
     [
         ["Base (No IH, No Bonus)", base_rlv, base_gdv, base_bulk, base_dcs],
-        ["IH Only", ih_rlv, ih_gdv, ih_bulk, ih_dcs],
+        ["IH Only", ih_rlv, ih_gdv, ih_bulk0, ih_dcs],
         ["IH + Bonus", ihb_rlv, ihb_gdv, ihb_bulk, ihb_dcs],
     ],
     columns=["Scenario", "RLV", "GDV", "Bulk_m2", "DevCharges"],
 )
-st.dataframe(
-    sc_df.assign(
-        RLV=sc_df["RLV"].map(money),
-        GDV=sc_df["GDV"].map(money),
-        DevCharges=sc_df["DevCharges"].map(money),
-        Bulk_m2=sc_df["Bulk_m2"].map(lambda x: f"{x:,.0f}"),
-    )[["Scenario", "RLV", "GDV", "Bulk_m2", "DevCharges"]],
-    use_container_width=True,
-    hide_index=True,
-)
+
+sc_show = sc_df.copy()
+sc_show["RLV"] = sc_show["RLV"].map(money)
+sc_show["GDV"] = sc_show["GDV"].map(money)
+sc_show["DevCharges"] = sc_show["DevCharges"].map(money)
+sc_show["Bulk_m2"] = sc_show["Bulk_m2"].map(lambda x: f"{x:,.0f}")
+
+st.dataframe(sc_show, use_container_width=True, hide_index=True)
 
 st.divider()
 
+
 # -----------------------
-# Sensitivity (NO pandas styler; use Plotly heatmap)
+# Sensitivity (robust heatmap)
 # -----------------------
 st.subheader("Sensitivity: IH Requirement vs Density Bonus")
 
@@ -169,7 +186,7 @@ for ih in ih_levels:
     row = []
     for b in bonus_levels:
         val, _, _, _, _ = calculate_metrics(land_size, ff_val, b, ih, market_price, const_cost)
-        row.append(val)  # keep raw RLV
+        row.append(float(val))
     matrix.append(row)
 
 df_map = pd.DataFrame(
@@ -178,19 +195,27 @@ df_map = pd.DataFrame(
     columns=[f"+{b}% Bonus" for b in bonus_levels],
 )
 
-# Heatmap
-fig = px.imshow(
-    df_map.values.astype(float),
-    x=df_map.columns,
-    y=df_map.index,
-    labels={"x": "Density Bonus", "y": "IH Requirement", "color": "RLV (R)"},
-    aspect="auto",
+# Heatmap with graph_objects (no px.imshow dependency)
+fig = go.Figure(
+    data=go.Heatmap(
+        z=df_map.values.astype(float),
+        x=df_map.columns,
+        y=df_map.index,
+        colorbar=dict(title="RLV (R)"),
+    )
+)
+fig.update_layout(
     title="RLV sensitivity heatmap (R)",
+    xaxis_title="Density Bonus",
+    yaxis_title="IH Requirement",
 )
 st.plotly_chart(fig, use_container_width=True)
 
-# Table + CSV export
-st.dataframe(df_map.applymap(lambda v: money(v)), use_container_width=True)
+# Table (formatted) + CSV
+fmt_df = df_map.copy()
+for c in fmt_df.columns:
+    fmt_df[c] = fmt_df[c].map(money)
+st.dataframe(fmt_df, use_container_width=True)
 
 st.download_button(
     "Download Sensitivity CSV",
