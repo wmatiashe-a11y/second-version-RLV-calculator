@@ -102,55 +102,17 @@ def create_pdf_bytes() -> bytes:
     pdf.add_page()
 
     pdf.set_font("Arial", "B", 14)
-    pdf.cell(190, 10, "Site Feasibility Report: Cape Town Redevelopment", ln=True, align="C")
-    pdf.ln(6)
+    pdf.cell(190, 10, "Site Feasibility Report", ln=True)
 
-    pdf.set_font("Arial", "B", 12)
-    pdf.cell(190, 8, "1) Inputs", ln=True)
-
+    # --- example content ---
     pdf.set_font("Arial", "", 10)
-    pdf.cell(95, 7, f"Land area: {land_size} m²", border=1)
-    pdf.cell(95, 7, f"Zoning: {zone_choice}", border=1, ln=True)
+    pdf.cell(190, 8, f"RLV: {money(rlv)}", ln=True)
 
-    pdf.cell(95, 7, f"Parking zone: {parking_zone}", border=1)
-    pdf.cell(95, 7, f"Base FAR: {ff_val}", border=1, ln=True)
-
-    pdf.cell(95, 7, f"Market price: {money(market_price)}/m²", border=1)
-    pdf.cell(95, 7, f"Const. cost used: {money(const_cost)}/m²", border=1, ln=True)
-
-    pdf.cell(95, 7, f"IH requirement: {ih_req}%", border=1)
-    pdf.cell(95, 7, f"Density bonus: +{density_bonus}%", border=1, ln=True)
-
-    pdf.ln(6)
-    pdf.set_font("Arial", "B", 12)
-    pdf.cell(190, 8, "2) Scenario Results", ln=True)
-
-    pdf.set_font("Arial", "", 10)
-
-    def scenario_block(title: str, rlv_v: float, gdv_v: float, bulk_v: float, dcs_v: float, ih_bulk_v: float):
-        pdf.set_font("Arial", "B", 11)
-        pdf.cell(190, 7, title, ln=True)
-        pdf.set_font("Arial", "", 10)
-
-        pdf.cell(95, 7, f"RLV: {money(rlv_v)}", border=1)
-        pdf.cell(95, 7, f"GDV: {money(gdv_v)}", border=1, ln=True)
-
-        pdf.cell(95, 7, f"Total bulk: {bulk_v:,.0f} m²", border=1)
-        pdf.cell(95, 7, f"Dev charges: {money(dcs_v)}", border=1, ln=True)
-
-        pdf.cell(190, 7, f"IH bulk: {ih_bulk_v:,.0f} m²", border=1, ln=True)
-        pdf.ln(3)
-
-    scenario_block("Base (No IH, No Bonus)", base_rlv, base_gdv, base_bulk, base_dcs, base_ih_bulk)
-    scenario_block("IH Only (IH, No Bonus)", ih_rlv, ih_gdv, ih_bulk, ih_dcs, ih_ih_bulk)
-    scenario_block("IH + Bonus", ihb_rlv, ihb_gdv, ihb_bulk, ihb_dcs, ihb_ih_bulk)
-
-    # Return bytes that Streamlit download_button accepts
+    # ✅ Correct indentation here
     raw = pdf.output(dest="S")
-pdf_bytes = raw if isinstance(raw, (bytes, bytearray)) else raw.encode("latin-1")
+    pdf_bytes = raw if isinstance(raw, (bytes, bytearray)) else raw.encode("latin-1")
 
     return pdf_bytes
-
 
 st.sidebar.download_button(
     label="📥 Download Feasibility Report (PDF)",
