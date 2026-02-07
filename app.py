@@ -105,26 +105,24 @@ def create_pdf(rlv, bulk, dcs, gdv, ih_req, bonus, zone, p_zone):
     pdf.ln(5)
     
     # Financial Results
-    pdf.set_font("Arial", "B", 12)
-    pdf.cell(190, 10, "2. Financial Summary", ln=True)
-    pdf.set_font("Arial", "B", 14)
-    pdf.set_text_color(0, 128, 0) # Green
-    pdf.cell(190, 12, f"RESIDUAL LAND VALUE: ZAR {rlv:,.2f}", border=1, ln=True, align="C")
-    
-    pdf.set_font("Arial", "", 10)
-    pdf.set_text_color(0, 0, 0)
-    pdf.cell(95, 8, f"Gross Development Value (GDV):", border=1)
-    pdf.cell(95, 8, f"ZAR {gdv:,.2f}", border=1, ln=True)
-    pdf.cell(95, 8, f"Total Allowable Bulk:", border=1)
-    pdf.cell(95, 8, f"{bulk:,.2f} m2", border=1, ln=True)
-    pdf.cell(95, 8, f"Development Charges (Payable):", border=1)
-    pdf.cell(95, 8, f"ZAR {dcs:,.2f}", border=1, ln=True)
-    
-    pdf.ln(10)
-    pdf.set_font("Arial", "I", 8)
-    pdf.multi_cell(190, 5, "Disclaimer: This report is a high-level residual land value estimate based on user inputs and current City of Cape Town DC guidelines. It does not constitute a formal valuation.")
-    
-    return pdf.output()
+# Example: build lines from your computed results
+summary_lines = [
+    f"Base RLV: {money(base_r.rlv)}",
+    f"IH RLV: {money(ih_r.rlv)}",
+    f"IH+Bonus RLV: {money(ihb_r.rlv)}",
+    f"IH+Bonus RLV/site m²: {money(ihb_r.rlv_per_site_m2)}",
+    f"Affordable mode: {inputs.affordable_mode}",
+    f"Finance model: {inputs.finance_model}",
+]
+
+pdf_data = build_pdf_bytes(summary_lines)  # <- this is BYTES
+
+st.sidebar.download_button(
+    label="📥 Download Feasibility Report (PDF)",
+    data=pdf_data,                       # <- MUST be bytes / BytesIO / str
+    file_name="feasibility_report.pdf",
+    mime="application/pdf",
+)
 
 # --- UI DISPLAY ---
 st.title("Cape Town Residual Land Value Calculator")
