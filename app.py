@@ -1,4 +1,7 @@
+import os
 import tempfile
+
+import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 from fpdf import FPDF
@@ -85,12 +88,12 @@ ihb_rlv, ihb_bulk, ihb_dcs, ihb_gdv, ihb_ih_bulk = calculate_metrics(
     land_size, ff_val, bonus=density_bonus, ih=ih_req, m_price=market_price, c_cost=const_cost
 )
 
-# Headline outputs
+# Headline outputs (IH + Bonus)
 rlv, bulk, dcs, gdv, ih_bulk = ihb_rlv, ihb_bulk, ihb_dcs, ihb_gdv, ihb_ih_bulk
 
 
 # -----------------------
-# PDF Generation (FPDF -> bytes)
+# PDF Generation (robust: write temp file -> read bytes)
 # -----------------------
 def create_pdf_bytes() -> bytes:
     pdf = FPDF()
@@ -115,26 +118,38 @@ def create_pdf_bytes() -> bytes:
     pdf.set_font("Arial", "B", 12)
     pdf.cell(190, 8, "Scenario Summary", ln=True)
     pdf.set_font("Arial", "", 10)
+    pdf.cell(190, 7, f"Base (No IH, No Bonus) RLV: {money(base_rlv)}", ln=True)
+    pdf.cell(190, 7, f"IH Only RLV: {money(ih_rlv)}", ln=True)
+    pdf.cell(190, 7, f"IH + Bonus RLV: {money(ihb_rlv)}", ln=True)
 
-    def line(title, rlv_v, gdv_v, bulk_v, dcs_v):
-        pdf.set_font("Arial", "B", 10)
-        pdf.cell(190, 7, title, ln=True)
-        pdf.set_font("Arial", "", 10)
-        pdf.cell(190, 6, f"RLV: {money(rlv_v)} | GDV: {money(gdv_v)} | Bulk: {bulk_v:,.0f} m² | Dev Charges: {money(dcs_v)}", ln=True)
-        pdf.ln(2)
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp_path = tmp.name
 
-    line("Base (No IH, No Bonus)", base_rlv, base_gdv, base_bulk, base_dcs)
-    line("IH Only", ih_rlv, ih_gdv, ih_bulk0, ih_dcs)
-    line("IH + Bonus", ihb_rlv, ihb_gdv, ihb_bulk, ihb_dcs)
+        pdf.output(tmp_path)
 
-    raw = pdf.output(dest="S")
-    pdf_bytes = raw if isinstance(raw, (bytes, bytearray)) else raw.encode("latin-1")
-    return pdf_bytes
+        with open(tmp_path, "rb") as f:
+            data = f.read()
 
+        return bytes(data)  # force exact bytes type
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+
+# Generate once and reuse
+pdf_data = create_pdf_bytes()
+
+# Optional debug (remove later)
+# st.sidebar.write("PDF bytes:", type(pdf_data), len(pdf_data))
 
 st.sidebar.download_button(
     label="📥 Download Feasibility Report (PDF)",
-    data=create_pdf_bytes(),
+    data=pdf_data,
     file_name="CPT_Feasibility_Report.pdf",
     mime="application/pdf",
     use_container_width=True,
@@ -174,7 +189,7 @@ st.divider()
 
 
 # -----------------------
-# Sensitivity (robust heatmap)
+# Sensitivity (heatmap)
 # -----------------------
 st.subheader("Sensitivity: IH Requirement vs Density Bonus")
 
@@ -195,7 +210,6 @@ df_map = pd.DataFrame(
     columns=[f"+{b}% Bonus" for b in bonus_levels],
 )
 
-# Heatmap with graph_objects (no px.imshow dependency)
 fig = go.Figure(
     data=go.Heatmap(
         z=df_map.values.astype(float),
@@ -211,10 +225,11 @@ fig.update_layout(
 )
 st.plotly_chart(fig, use_container_width=True)
 
-# Table (formatted) + CSV
+# Table + CSV export
 fmt_df = df_map.copy()
 for c in fmt_df.columns:
     fmt_df[c] = fmt_df[c].map(money)
+
 st.dataframe(fmt_df, use_container_width=True)
 
 st.download_button(
