@@ -32,6 +32,10 @@ def build_pdf_bytes(summary_lines: list[str]) -> bytes:
     return pdf_bytes
 
 import streamlit as st
+def money(v: float) -> str:
+    sign = "-" if v < 0 else ""
+    return f"{sign}R{abs(v):,.0f}"
+
 import pandas as pd
 from fpdf import FPDF
 import io
