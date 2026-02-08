@@ -1,12 +1,12 @@
 import os
-from urllib.parse import quote_plus
+import tempfile
+from dataclasses import dataclass
 
 import pandas as pd
-import plotly.graph_objects as go
-import requests
 import streamlit as st
+import plotly.graph_objects as go
 from fpdf import FPDF
-from fpdf.enums import XPos, YPos
+import streamlit.components.v1 as components
 
 
 # -----------------------
@@ -17,49 +17,8 @@ def money(v: float) -> str:
     return f"{sign}R{abs(v):,.0f}"
 
 
-def get_google_key() -> str | None:
-    # Prefer Streamlit secrets; fall back to env var
-    try:
-        key = st.secrets.get("GOOGLE_MAPS_API_KEY")
-        return key if key else None
-    except Exception:
-        key = os.environ.get("GOOGLE_MAPS_API_KEY")
-        return key if key else None
-
-
-@st.cache_data(show_spinner=False, ttl=60 * 60)
-def geocode_address(address: str, api_key: str) -> dict | None:
-    """Returns dict with lat, lng, formatted_address. None if not found."""
-    if not address.strip():
-        return None
-    url = "https://maps.googleapis.com/maps/api/geocode/json"
-    params = {"address": address, "key": api_key}
-    r = requests.get(url, params=params, timeout=15)
-    r.raise_for_status()
-    data = r.json()
-    if data.get("status") != "OK" or not data.get("results"):
-        return None
-    res = data["results"][0]
-    loc = res["geometry"]["location"]
-    return {
-        "lat": float(loc["lat"]),
-        "lng": float(loc["lng"]),
-        "formatted_address": res.get("formatted_address", address),
-    }
-
-
-def card_html(title: str, body: str) -> str:
-    return f"""
-    <div style="
-        border:1px solid rgba(49,51,63,0.2);
-        border-radius:12px;
-        padding:12px 14px;
-        background: rgba(250,250,250,0.6);
-        margin-bottom:10px;">
-        <div style="font-weight:700; margin-bottom:6px;">{title}</div>
-        <div style="font-size:0.95rem; line-height:1.35;">{body}</div>
-    </div>
-    """
+def clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
 
 
 # -----------------------
@@ -78,13 +37,65 @@ ZONING = {
 DC_RATE = 514.10
 IH_CAP_PRICE = 15000
 
+# City of Cape Town Map Viewer (EGIS Viewer / CityMap public viewer)
+CITYMAP_VIEWER_URL = "https://citymaps.capetown.gov.za/EGISViewer/"
+
+
+# -----------------------
+# Heritage overlay model
+# -----------------------
+@dataclass(frozen=True)
+class HeritageOverlay:
+    enabled: bool
+    bulk_reduction_pct: float      # reduces achievable bulk (a proxy for restrictions)
+    cost_uplift_pct: float         # increases construction costs (specialist methods/materials)
+    fees_uplift_pct: float         # increases professional fees
+    profit_uplift_pct: float       # increases required profit/contingency due to approval risk
+
+
+def apply_heritage_overlay(
+    total_bulk: float,
+    base_cost_sqm: float,
+    base_fees_rate: float,
+    base_profit_rate: float,
+    overlay: HeritageOverlay,
+) -> tuple[float, float, float, float]:
+    """
+    Returns:
+      (adj_total_bulk, adj_cost_sqm, adj_fees_rate, adj_profit_rate)
+    """
+    if not overlay.enabled:
+        return total_bulk, base_cost_sqm, base_fees_rate, base_profit_rate
+
+    adj_bulk = total_bulk * (1.0 - overlay.bulk_reduction_pct / 100.0)
+    adj_cost = base_cost_sqm * (1.0 + overlay.cost_uplift_pct / 100.0)
+    adj_fees = base_fees_rate * (1.0 + overlay.fees_uplift_pct / 100.0)
+    adj_profit = base_profit_rate * (1.0 + overlay.profit_uplift_pct / 100.0)
+    return adj_bulk, adj_cost, adj_fees, adj_profit
+
 
 # -----------------------
 # Inputs (Sidebar)
 # -----------------------
 st.sidebar.title("🛠️ Development Inputs")
 
+# Property Quick-Profile (CityMap)
+st.sidebar.subheader("🏠 Property Quick-Profile (CityMap)")
+q = st.sidebar.text_input(
+    "Search / Address / Erf (use CityMap Viewer)",
+    placeholder="e.g. '123 Main Road, Sea Point' or 'Erf 12345'",
+)
+st.sidebar.caption("Tip: Use the City of Cape Town Map Viewer to identify the erf and confirm land area / constraints.")
+if q.strip():
+    st.sidebar.markdown(
+        f"Open CityMap Viewer and search for: **{q.strip()}**  \n"
+        f"➡️ {CITYMAP_VIEWER_URL}"
+    )
+else:
+    st.sidebar.markdown(f"➡️ {CITYMAP_VIEWER_URL}")
+
 land_size = st.sidebar.number_input("Land Area (m²)", min_value=1, value=1000, step=50)
+
 zone_choice = st.sidebar.selectbox("Zoning Preset", list(ZONING.keys()))
 parking_zone = st.sidebar.radio("Parking Zone", ["Standard", "PT1 (Reduced)", "PT2 (Zero)"])
 
@@ -94,132 +105,80 @@ const_cost_base = st.sidebar.slider("Base Construction (R/m²)", 12000, 25000, 1
 ih_req = st.sidebar.slider("Inclusionary Housing (%)", 0, 30, 20, step=1)
 density_bonus = st.sidebar.slider("Density Bonus (%)", 0, 100, 20, step=5)
 
-# -----------------------
-# Built Heritage Overlay (HPO/HPOZ)
-# -----------------------
-st.sidebar.subheader("🏛️ Built Heritage (HPO / HPOZ)")
+st.sidebar.divider()
+st.sidebar.subheader("🏛️ Built Heritage Overlay (City of Cape Town)")
 
-heritage_on = st.sidebar.checkbox(
-    "Site is within a Heritage Protection Overlay (HPO/HPOZ)",
-    value=False,
-    help=(
-        "Overlay often triggers additional approvals/conditions. "
-        "This tool conservatively assumes bonus bulk is not achievable unless approvals are secured."
-    ),
+heritage_enabled = st.sidebar.checkbox("Apply Built Heritage overlay adjustments", value=False)
+st.sidebar.caption(
+    "This is a **feasibility proxy** for Heritage Protection Overlay / heritage constraints: "
+    "reduced developable bulk + cost/fees/risk uplifts. Tune to match your sub-area/precedent."
 )
 
-heritage_approvals_secured = st.sidebar.checkbox(
-    "Assume heritage approvals secured for additional bulk/bonus",
-    value=False,
-    help="If unticked and HPO/HPOZ applies, density bonus is treated as 0.",
+heritage_bulk_reduction = st.sidebar.slider("Bulk reduction (%)", 0, 40, 10, step=1, disabled=not heritage_enabled)
+heritage_cost_uplift = st.sidebar.slider("Construction cost uplift (%)", 0, 30, 8, step=1, disabled=not heritage_enabled)
+heritage_fees_uplift = st.sidebar.slider("Fees uplift (%)", 0, 30, 5, step=1, disabled=not heritage_enabled)
+heritage_profit_uplift = st.sidebar.slider("Profit/risk uplift (%)", 0, 30, 5, step=1, disabled=not heritage_enabled)
+
+heritage_for_sensitivity = st.sidebar.checkbox(
+    "Include Built Heritage overlay in sensitivity analysis",
+    value=True,
+    disabled=not heritage_enabled,
 )
 
-heritage_cost_uplift = st.sidebar.slider("Heritage construction cost uplift (%)", 0, 40, 8, step=1)
-heritage_fees_uplift = st.sidebar.slider("Heritage professional fees uplift (%)", 0, 60, 15, step=1)
-heritage_profit_uplift = st.sidebar.slider("Heritage risk/profit uplift (%)", 0, 20, 3, step=1)
-
-# -----------------------
-# Coastal / Wind Premium
-# -----------------------
-st.sidebar.subheader("💨 Coastal / Wind")
-wind_on = st.sidebar.checkbox("High-wind / coastal exposure", value=False)
-wind_glazing_uplift = st.sidebar.slider("Wind uplift to construction cost (%)", 0, 15, 4, step=1)
-
-
-# -----------------------
-# Header: Property Quick-Profile (Main)
-# -----------------------
-st.markdown("## Property Quick-Profile")
-
-google_key = get_google_key()
-address = st.text_input(
-    "Search / Address (optional)",
-    placeholder="e.g., 1 Wale Street, Cape Town",
+overlay = HeritageOverlay(
+    enabled=heritage_enabled,
+    bulk_reduction_pct=float(heritage_bulk_reduction),
+    cost_uplift_pct=float(heritage_cost_uplift),
+    fees_uplift_pct=float(heritage_fees_uplift),
+    profit_uplift_pct=float(heritage_profit_uplift),
 )
-
-geo = None
-if address and google_key:
-    try:
-        geo = geocode_address(address, google_key)
-        if geo:
-            st.caption(f"📌 {geo['formatted_address']} • Lat {geo['lat']:.5f}, Lng {geo['lng']:.5f}")
-    except Exception:
-        st.warning("Google geocoding failed. Check your API key, billing, and that the Geocoding API is enabled.")
-elif address and not google_key:
-    st.info("To enable map lookup, set GOOGLE_MAPS_API_KEY in Streamlit secrets or env vars.")
-
-# Map preview (embed)
-if geo and google_key:
-    q = quote_plus(geo["formatted_address"])
-    iframe = f"""
-    <iframe
-      width="100%"
-      height="260"
-      style="border:0; border-radius:12px;"
-      loading="lazy"
-      allowfullscreen
-      referrerpolicy="no-referrer-when-downgrade"
-      src="https://www.google.com/maps/embed/v1/place?key={google_key}&q={q}">
-    </iframe>
-    """
-    st.components.v1.html(iframe, height=280)
-
-st.caption(
-    "Note: Google Maps can locate the site, but it does not provide cadastral erf/plot size. "
-    "Use the sidebar Land Area input (or link a cadastral dataset later)."
-)
-
-st.divider()
-
 
 # -----------------------
 # Calculation Engine
 # -----------------------
 def calculate_metrics(
-    land, ff, bonus, ih, m_price, c_cost,
-    heritage_on=False,
-    heritage_approvals_secured=False,
-    heritage_cost_uplift=0,
-    heritage_fees_uplift=0,
-    heritage_profit_uplift=0,
-    wind_on=False,
-    wind_glazing_uplift=0,
-):
-    # Conservative assumption:
-    # If HPO/HPOZ applies and approvals are NOT secured, do not assume density bonus is achievable.
-    effective_bonus = bonus
-    if heritage_on and not heritage_approvals_secured:
-        effective_bonus = 0
+    land: float,
+    ff: float,
+    bonus: float,
+    ih: float,
+    m_price: float,
+    c_cost_sqm: float,
+    overlay_obj: HeritageOverlay,
+) -> tuple[float, float, float, float, float]:
+    """
+    Returns:
+      (rlv, total_bulk, dev_charges, gdv, ih_bulk)
+    """
+    # Base bulk
+    total_bulk_raw = (land * ff) * (1 + (bonus / 100.0))
 
-    total_bulk = (land * ff) * (1 + (effective_bonus / 100.0))
+    # Rates
+    base_fees_rate = 0.125
+    base_profit_rate = 0.20
 
+    # Apply heritage overlay to bulk + cost/fees/profit rates
+    total_bulk, adj_cost_sqm, fees_rate, profit_rate = apply_heritage_overlay(
+        total_bulk=total_bulk_raw,
+        base_cost_sqm=c_cost_sqm,
+        base_fees_rate=base_fees_rate,
+        base_profit_rate=base_profit_rate,
+        overlay=overlay_obj,
+    )
+
+    # IH split
     ih_bulk = total_bulk * (ih / 100.0)
     market_bulk = total_bulk - ih_bulk
 
+    # Value + costs
     gdv = (market_bulk * m_price) + (ih_bulk * IH_CAP_PRICE)
-
-    # Development charges (kept consistent with your original logic)
     dev_charges = market_bulk * DC_RATE
 
-    # Apply uplifts
-    used_cost = c_cost
-    if heritage_on:
-        used_cost *= (1 + (heritage_cost_uplift / 100.0))
-    if wind_on:
-        used_cost *= (1 + (wind_glazing_uplift / 100.0))
-
-    construction = total_bulk * used_cost
-
-    base_fee_rate = 0.125
-    fee_rate = base_fee_rate * (1 + (heritage_fees_uplift / 100.0)) if heritage_on else base_fee_rate
-    fees = construction * fee_rate
-
-    base_profit_rate = 0.20
-    profit_rate = base_profit_rate * (1 + (heritage_profit_uplift / 100.0)) if heritage_on else base_profit_rate
+    construction = total_bulk * adj_cost_sqm
+    fees = construction * fees_rate
     profit_target = gdv * profit_rate
 
     rlv = gdv - construction - dev_charges - fees - profit_target
-    return rlv, total_bulk, dev_charges, gdv, ih_bulk
+    return float(rlv), float(total_bulk), float(dev_charges), float(gdv), float(ih_bulk)
 
 
 # Parking adjustment
@@ -230,38 +189,17 @@ elif parking_zone == "PT1 (Reduced)":
 else:
     const_cost = const_cost_base
 
-ff_val = ZONING[zone_choice]["ff"]
+ff_val = float(ZONING[zone_choice]["ff"])
 
-# Scenarios
+# Scenarios (heritage applies to the dashboard if enabled)
 base_rlv, base_bulk, base_dcs, base_gdv, base_ih_bulk = calculate_metrics(
-    land_size, ff_val, bonus=0, ih=0, m_price=market_price, c_cost=const_cost,
-    heritage_on=heritage_on,
-    heritage_approvals_secured=heritage_approvals_secured,
-    heritage_cost_uplift=heritage_cost_uplift,
-    heritage_fees_uplift=heritage_fees_uplift,
-    heritage_profit_uplift=heritage_profit_uplift,
-    wind_on=wind_on,
-    wind_glazing_uplift=wind_glazing_uplift,
+    land_size, ff_val, bonus=0, ih=0, m_price=market_price, c_cost_sqm=const_cost, overlay_obj=overlay
 )
 ih_rlv, ih_bulk0, ih_dcs, ih_gdv, ih_ih_bulk = calculate_metrics(
-    land_size, ff_val, bonus=0, ih=ih_req, m_price=market_price, c_cost=const_cost,
-    heritage_on=heritage_on,
-    heritage_approvals_secured=heritage_approvals_secured,
-    heritage_cost_uplift=heritage_cost_uplift,
-    heritage_fees_uplift=heritage_fees_uplift,
-    heritage_profit_uplift=heritage_profit_uplift,
-    wind_on=wind_on,
-    wind_glazing_uplift=wind_glazing_uplift,
+    land_size, ff_val, bonus=0, ih=ih_req, m_price=market_price, c_cost_sqm=const_cost, overlay_obj=overlay
 )
 ihb_rlv, ihb_bulk, ihb_dcs, ihb_gdv, ihb_ih_bulk = calculate_metrics(
-    land_size, ff_val, bonus=density_bonus, ih=ih_req, m_price=market_price, c_cost=const_cost,
-    heritage_on=heritage_on,
-    heritage_approvals_secured=heritage_approvals_secured,
-    heritage_cost_uplift=heritage_cost_uplift,
-    heritage_fees_uplift=heritage_fees_uplift,
-    heritage_profit_uplift=heritage_profit_uplift,
-    wind_on=wind_on,
-    wind_glazing_uplift=wind_glazing_uplift,
+    land_size, ff_val, bonus=density_bonus, ih=ih_req, m_price=market_price, c_cost_sqm=const_cost, overlay_obj=overlay
 )
 
 # Headline outputs (IH + Bonus)
@@ -269,93 +207,101 @@ rlv, bulk, dcs, gdv, ih_bulk = ihb_rlv, ihb_bulk, ihb_dcs, ihb_gdv, ihb_ih_bulk
 
 
 # -----------------------
-# PDF Generation (FPDF2 compliant + bytearray-safe)
+# PDF Generation (robust)
 # -----------------------
 @st.cache_data(show_spinner=False)
-def create_pdf_bytes(
-    land_size, zone_choice, ff_val, parking_zone,
-    market_price, const_cost, ih_req, density_bonus,
-    base_rlv, ih_rlv, ihb_rlv,
-    heritage_on, heritage_approvals_secured,
-    heritage_cost_uplift, heritage_fees_uplift, heritage_profit_uplift,
-    wind_on, wind_glazing_uplift,
+def create_pdf_bytes_cached(
+    land_area: float,
+    zone: str,
+    ff: float,
+    parking: str,
+    m_price: float,
+    base_cost: float,
+    used_cost: float,
+    ih_pct: int,
+    bonus_pct: int,
+    heritage_on: bool,
+    heritage_bulk_red: float,
+    heritage_cost_upl: float,
+    heritage_fees_upl: float,
+    heritage_profit_upl: float,
+    base_rlv_in: float,
+    ih_rlv_in: float,
+    ihb_rlv_in: float,
 ) -> bytes:
     pdf = FPDF()
     pdf.add_page()
 
     pdf.set_font("Helvetica", "B", 14)
-    pdf.cell(
-        190, 10,
-        "Site Feasibility Report: Cape Town Redevelopment",
-        new_x=XPos.LMARGIN, new_y=YPos.NEXT,
-        align="C",
-    )
-    pdf.ln(4)
+    pdf.cell(190, 10, "Site Feasibility Report: Cape Town Redevelopment", ln=True, align="C")
+    pdf.ln(6)
 
     pdf.set_font("Helvetica", "B", 12)
-    pdf.cell(190, 8, "Inputs", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.cell(190, 8, "Inputs", ln=True)
 
     pdf.set_font("Helvetica", "", 10)
-    pdf.cell(190, 7, f"Land area: {land_size} m²", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.cell(190, 7, f"Zoning: {zone_choice} (FAR={ff_val})", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.cell(190, 7, f"Parking zone: {parking_zone}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.cell(190, 7, f"Market price: {money(market_price)}/m²", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.cell(190, 7, f"Construction cost used (base): {money(const_cost)}/m²", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.cell(190, 7, f"IH requirement: {ih_req}%", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.cell(190, 7, f"Density bonus (requested): +{density_bonus}%", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.cell(190, 7, f"Land area: {land_area:,.0f} m²", ln=True)
+    pdf.cell(190, 7, f"Zoning: {zone} (FAR={ff})", ln=True)
+    pdf.cell(190, 7, f"Parking zone: {parking}", ln=True)
+    pdf.cell(190, 7, f"Market price: {money(m_price)}/m²", ln=True)
+    pdf.cell(190, 7, f"Base construction cost: {money(base_cost)}/m²", ln=True)
+    pdf.cell(190, 7, f"Construction cost used: {money(used_cost)}/m²", ln=True)
+    pdf.cell(190, 7, f"IH requirement: {ih_pct}%", ln=True)
+    pdf.cell(190, 7, f"Density bonus: +{bonus_pct}%", ln=True)
 
-    pdf.ln(2)
+    pdf.ln(3)
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(190, 7, "Built Heritage overlay (proxy adjustments)", ln=True)
+    pdf.set_font("Helvetica", "", 10)
+    pdf.cell(190, 7, f"Enabled: {'Yes' if heritage_on else 'No'}", ln=True)
+    if heritage_on:
+        pdf.cell(190, 7, f"Bulk reduction: {heritage_bulk_red:.0f}%", ln=True)
+        pdf.cell(190, 7, f"Cost uplift: {heritage_cost_upl:.0f}%", ln=True)
+        pdf.cell(190, 7, f"Fees uplift: {heritage_fees_upl:.0f}%", ln=True)
+        pdf.cell(190, 7, f"Profit/risk uplift: {heritage_profit_upl:.0f}%", ln=True)
+
+    pdf.ln(6)
     pdf.set_font("Helvetica", "B", 12)
-    pdf.cell(190, 8, "Built Heritage (HPO/HPOZ)", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-
+    pdf.cell(190, 8, "Scenario Summary", ln=True)
     pdf.set_font("Helvetica", "", 10)
-    pdf.cell(190, 7, f"HPO/HPOZ applies: {'YES' if heritage_on else 'NO'}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.cell(
-        190, 7,
-        f"Approvals secured for additional bulk/bonus: {'YES' if heritage_approvals_secured else 'NO'}",
-        new_x=XPos.LMARGIN, new_y=YPos.NEXT,
-    )
-    if heritage_on and not heritage_approvals_secured:
-        pdf.cell(
-            190, 7,
-            "Note: Density bonus treated as 0% (conservative under HPO/HPOZ without approvals).",
-            new_x=XPos.LMARGIN, new_y=YPos.NEXT,
-        )
-    pdf.cell(190, 7, f"Cost uplift: {heritage_cost_uplift}%", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.cell(190, 7, f"Fees uplift: {heritage_fees_uplift}%", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.cell(190, 7, f"Profit/risk uplift: {heritage_profit_uplift}%", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.cell(190, 7, f"Base (No IH, No Bonus) RLV: {money(base_rlv_in)}", ln=True)
+    pdf.cell(190, 7, f"IH Only RLV: {money(ih_rlv_in)}", ln=True)
+    pdf.cell(190, 7, f"IH + Bonus RLV: {money(ihb_rlv_in)}", ln=True)
 
-    pdf.ln(2)
-    pdf.set_font("Helvetica", "B", 12)
-    pdf.cell(190, 8, "Coastal / Wind", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.set_font("Helvetica", "", 10)
-    pdf.cell(190, 7, f"High-wind exposure: {'YES' if wind_on else 'NO'}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.cell(190, 7, f"Wind uplift: {wind_glazing_uplift}%", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-
-    pdf.ln(4)
-    pdf.set_font("Helvetica", "B", 12)
-    pdf.cell(190, 8, "Scenario Summary", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-
-    pdf.set_font("Helvetica", "", 10)
-    pdf.cell(190, 7, f"Base (No IH, No Bonus) RLV: {money(base_rlv)}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.cell(190, 7, f"IH Only RLV: {money(ih_rlv)}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.cell(190, 7, f"IH + Bonus RLV: {money(ihb_rlv)}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-
-    # --- IMPORTANT FIX ---
-    # fpdf2 may return str OR bytearray depending on version/config
-    out = pdf.output(dest="S")
-    if isinstance(out, (bytes, bytearray)):
-        return bytes(out)
-    return out.encode("latin-1", errors="replace")
+    # robust bytes via tempfile (works across fpdf/fpdf2 variants)
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp_path = tmp.name
+        pdf.output(tmp_path)
+        with open(tmp_path, "rb") as f:
+            return f.read()
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
 
 
-pdf_data = create_pdf_bytes(
-    land_size, zone_choice, ff_val, parking_zone,
-    market_price, const_cost, ih_req, density_bonus,
-    base_rlv, ih_rlv, ihb_rlv,
-    heritage_on, heritage_approvals_secured,
-    heritage_cost_uplift, heritage_fees_uplift, heritage_profit_uplift,
-    wind_on, wind_glazing_uplift,
+pdf_data = create_pdf_bytes_cached(
+    land_area=float(land_size),
+    zone=zone_choice,
+    ff=float(ff_val),
+    parking=parking_zone,
+    m_price=float(market_price),
+    base_cost=float(const_cost_base),
+    used_cost=float(const_cost),
+    ih_pct=int(ih_req),
+    bonus_pct=int(density_bonus),
+    heritage_on=bool(heritage_enabled),
+    heritage_bulk_red=float(heritage_bulk_reduction),
+    heritage_cost_upl=float(heritage_cost_uplift),
+    heritage_fees_upl=float(heritage_fees_uplift),
+    heritage_profit_upl=float(heritage_profit_uplift),
+    base_rlv_in=float(base_rlv),
+    ih_rlv_in=float(ih_rlv),
+    ihb_rlv_in=float(ihb_rlv),
 )
 
 st.sidebar.download_button(
@@ -372,129 +318,41 @@ st.sidebar.download_button(
 # -----------------------
 st.title("Cape Town Residual Land Value Calculator")
 
+# Header: Property Quick-Profile (CityMap Viewer)
+with st.container(border=True):
+    st.subheader("🏠 Property Quick-Profile")
+    cA, cB = st.columns([2, 1])
+    with cA:
+        header_q = st.text_input(
+            "Search / Address / Erf (City of Cape Town Map Viewer)",
+            value=q,
+            placeholder="Type an address or erf number, then use CityMap Viewer to identify the parcel and constraints.",
+        )
+        st.caption(
+            "Note: The public CityMap/EGIS Viewer is used here as a *viewer*. "
+            "Parcel size auto-fetch is not enabled in this build—confirm land area and constraints in CityMap, then enter Land Area (m²) in the sidebar."
+        )
+    with cB:
+        st.link_button("Open CityMap Viewer", CITYMAP_VIEWER_URL, width="stretch")
+
+    # Optional embedded viewer (lightweight)
+    with st.expander("Open embedded CityMap Viewer (optional)", expanded=False):
+        components.iframe(CITYMAP_VIEWER_URL, height=520)
+
+
+# Main KPIs
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Residual Land Value (IH+Bonus)", money(rlv))
 c2.metric("Total Bulk (m²)", f"{bulk:,.0f}")
 c3.metric("Dev Charges", money(dcs))
 c4.metric("Total GDV", money(gdv))
 
+if heritage_enabled:
+    st.info(
+        "Built Heritage overlay is ON (proxy adjustments applied to bulk, costs, fees and profit/risk). "
+        "Use sensitivity below to see the effect across IH and bonus combinations."
+    )
 
-# -----------------------
-# The Feasibility Lens (Main Dashboard)
-# -----------------------
-st.markdown("## The Feasibility Lens")
-
-# Small, tappable cards (buttons) that toggle detail cards
-lens_c1, lens_c2, lens_c3 = st.columns(3)
-
-if "show_comps" not in st.session_state:
-    st.session_state.show_comps = False
-if "show_bulk" not in st.session_state:
-    st.session_state.show_bulk = False
-if "show_wind" not in st.session_state:
-    st.session_state.show_wind = False
-
-with lens_c1:
-    if st.button("📍 Local Comps", width="stretch"):
-        st.session_state.show_comps = not st.session_state.show_comps
-with lens_c2:
-    if st.button("🏗️ Bulk Efficiency", width="stretch"):
-        st.session_state.show_bulk = not st.session_state.show_bulk
-with lens_c3:
-    if st.button("💨 Coastal Premium", width="stretch"):
-        st.session_state.show_wind = not st.session_state.show_wind
-
-st.caption("Cape Town Context (tap a card button above to expand details)")
-
-# Lens data
-if "local_comps" not in st.session_state:
-    st.session_state.local_comps = 42000
-
-FAR_LOOKUP = {
-    "SR1 (Single Residential)": 0.5,     # placeholder for lens narrative (adjust if desired)
-    "GR2 (Residential)": 1.0,
-    "GR4 (High Density)": 1.5,
-    "MU1 (Mixed Use)": 1.5,
-    "MU2 (High Density Mixed)": 4.0,
-    "GB7 (CBD/High Rise)": 12.0,
-}
-
-if "current_zone" not in st.session_state:
-    st.session_state.current_zone = "SR1 (Single Residential)"
-if "target_zone" not in st.session_state:
-    st.session_state.target_zone = "GR2 (Residential)"
-
-# Detail tray
-tray = st.container()
-
-with tray:
-    if st.session_state.show_comps:
-        st.markdown(
-            card_html(
-                "📍 Local Comps",
-                f"Recent sales in this sub-zone (placeholder): <b>{money(st.session_state.local_comps)}/m²</b>.<br>"
-                f"Your input market price: <b>{money(market_price)}/m²</b>."
-            ),
-            unsafe_allow_html=True,
-        )
-        st.session_state.local_comps = int(
-            st.number_input(
-                "Update Local Comps (R/m²)",
-                min_value=10000,
-                max_value=150000,
-                value=int(st.session_state.local_comps),
-                step=500,
-            )
-        )
-
-    if st.session_state.show_bulk:
-        current_zone = st.session_state.current_zone
-        target_zone = st.session_state.target_zone
-        current_far = FAR_LOOKUP.get(current_zone, 0.5)
-        target_far = FAR_LOOKUP.get(target_zone, 1.0)
-
-        current_bulk_lens = land_size * current_far
-        target_bulk_lens = land_size * target_far
-        target_sellable_lens = target_bulk_lens * 0.85
-
-        st.markdown(
-            card_html(
-                "🏗️ Bulk Efficiency",
-                f"You can build ~<b>{target_bulk_lens:,.0f}m²</b> gross bulk on this <b>{land_size:,}m²</b> plot "
-                f"if rezoned from <b>{current_zone}</b> to <b>{target_zone}</b>.<br>"
-                f"Approx. sellable area @ 85% efficiency: <b>{target_sellable_lens:,.0f}m²</b>.<br>"
-                f"(Current notional bulk: <b>{current_bulk_lens:,.0f}m²</b>.)"
-            ),
-            unsafe_allow_html=True,
-        )
-        z1, z2 = st.columns(2)
-        with z1:
-            st.session_state.current_zone = st.selectbox(
-                "Current zone (lens only)",
-                list(FAR_LOOKUP.keys()),
-                index=list(FAR_LOOKUP.keys()).index(current_zone),
-            )
-        with z2:
-            st.session_state.target_zone = st.selectbox(
-                "Target zone (lens only)",
-                list(FAR_LOOKUP.keys()),
-                index=list(FAR_LOOKUP.keys()).index(target_zone),
-            )
-
-    if st.session_state.show_wind:
-        wind_text = (
-            f"High-wind zone: Adding <b>{wind_glazing_uplift}%</b> to construction cost."
-            if wind_on else
-            "Wind premium is currently <b>OFF</b>. Toggle it in the sidebar to apply the cost uplift."
-        )
-        st.markdown(card_html("💨 Coastal Premium", wind_text), unsafe_allow_html=True)
-
-st.divider()
-
-
-# -----------------------
-# Scenario Comparison
-# -----------------------
 st.subheader("Scenario Comparison")
 sc_df = pd.DataFrame(
     [
@@ -517,26 +375,23 @@ st.divider()
 
 
 # -----------------------
-# Sensitivity (heritage + wind aware heatmap)
+# Sensitivity (heatmap)
 # -----------------------
 st.subheader("Sensitivity: IH Requirement vs Density Bonus")
 
 ih_levels = [0, 10, 20, 30]
 bonus_levels = [0, 20, 40, 60, 80, 100]
 
+overlay_for_map = overlay if (heritage_enabled and heritage_for_sensitivity) else HeritageOverlay(
+    enabled=False, bulk_reduction_pct=0, cost_uplift_pct=0, fees_uplift_pct=0, profit_uplift_pct=0
+)
+
 matrix = []
 for ih in ih_levels:
     row = []
     for b in bonus_levels:
         val, _, _, _, _ = calculate_metrics(
-            land_size, ff_val, b, ih, market_price, const_cost,
-            heritage_on=heritage_on,
-            heritage_approvals_secured=heritage_approvals_secured,
-            heritage_cost_uplift=heritage_cost_uplift,
-            heritage_fees_uplift=heritage_fees_uplift,
-            heritage_profit_uplift=heritage_profit_uplift,
-            wind_on=wind_on,
-            wind_glazing_uplift=wind_glazing_uplift,
+            land_size, ff_val, b, ih, market_price, const_cost, overlay_for_map
         )
         row.append(float(val))
     matrix.append(row)
@@ -557,7 +412,7 @@ fig = go.Figure(
 )
 fig.update_layout(
     title="RLV sensitivity heatmap (R)",
-    xaxis_title="Density Bonus (requested; may be constrained by overlays)",
+    xaxis_title="Density Bonus",
     yaxis_title="IH Requirement",
 )
 st.plotly_chart(fig, width="stretch")
@@ -576,3 +431,43 @@ st.download_button(
     mime="text/csv",
     width="stretch",
 )
+
+st.divider()
+
+
+# -----------------------
+# The Feasibility Lens (Bottom Tray)
+# -----------------------
+st.subheader("🔎 The Feasibility Lens")
+
+# Local comps (placeholder card – you can wire to your comps DB later)
+comps_note = "Recent sales in this sub-zone: R42,000/m²."
+
+# Bulk efficiency card (simple narrative + approximate buildable bulk)
+# Your model uses FAR*land*(1+bonus), but "sellable" concept isn't explicitly modeled.
+approx_bulk_gr2 = land_size * ZONING["GR2 (Residential - 1.0 FF)"]["ff"]
+bulk_eff_note = f"You can build ~{approx_bulk_gr2:,.0f} m² on this plot if rezoned to GR2 (before bonuses/overlays)."
+
+# Coastal premium (proxy)
+# If you want this to actually affect costs, add a coastal toggle + uplift into overlay pipeline.
+coastal_note = "High-wind zone: Adding 4% to window/glazing costs."
+
+tray1, tray2, tray3 = st.columns(3)
+
+with tray1:
+    with st.container(border=True):
+        st.markdown("### 📍 Local Comps")
+        st.write(comps_note)
+        st.caption("Tip: Replace with your own comps feed by suburb/sub-zone.")
+
+with tray2:
+    with st.container(border=True):
+        st.markdown("### 🏗️ Bulk Efficiency")
+        st.write(bulk_eff_note)
+        st.caption("Approximation shown. Final bulk depends on zoning, bonuses, and overlays.")
+
+with tray3:
+    with st.container(border=True):
+        st.markdown("### 💨 Coastal Premium")
+        st.write(coastal_note)
+        st.caption("Proxy note only (not applied in the calculation yet).")
