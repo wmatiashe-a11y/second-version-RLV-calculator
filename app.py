@@ -154,7 +154,7 @@ rlv, bulk, dcs, gdv, ih_bulk = ihb_rlv, ihb_bulk, ihb_dcs, ihb_gdv, ihb_ih_bulk
 
 
 # -----------------------
-# PDF Generation (FPDF2 compliant)
+# PDF Generation (FPDF2 compliant + bytearray-safe)
 # -----------------------
 @st.cache_data(show_spinner=False)
 def create_pdf_bytes(
@@ -202,7 +202,7 @@ def create_pdf_bytes(
     if heritage_on and not heritage_approvals_secured:
         pdf.cell(
             190, 7,
-            "Note: Density bonus treated as 0% (conservative assumption under HPO/HPOZ without approvals).",
+            "Note: Density bonus treated as 0% (conservative under HPO/HPOZ without approvals).",
             new_x=XPos.LMARGIN, new_y=YPos.NEXT,
         )
     pdf.cell(190, 7, f"Cost uplift: {heritage_cost_uplift}%", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
@@ -218,7 +218,12 @@ def create_pdf_bytes(
     pdf.cell(190, 7, f"IH Only RLV: {money(ih_rlv)}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.cell(190, 7, f"IH + Bonus RLV: {money(ihb_rlv)}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
-    return pdf.output(dest="S").encode("latin-1", errors="replace")
+    # --- IMPORTANT FIX ---
+    # fpdf2 may return str OR bytearray depending on version/config
+    out = pdf.output(dest="S")
+    if isinstance(out, (bytes, bytearray)):
+        return bytes(out)
+    return out.encode("latin-1", errors="replace")
 
 
 pdf_data = create_pdf_bytes(
